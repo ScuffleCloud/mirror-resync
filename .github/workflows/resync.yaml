@@ -9,37 +9,54 @@ on:
 
 jobs:
   resync:
-    name: Resync
+    name: Resync (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - remote: https://gitlab.freedesktop.org/fontconfig/fontconfig.git
-            mirror: scufflecloud/fontconfig-mirror
-            topics: [fontconfig]
-          - remote: https://sourceforge.net/p/opencore-amr/fdk-aac/ci/master/tree
-            mirror: scufflecloud/fdk-aac-mirror
-            topics: [fdk-aac]
+            name: fontconfig
+          - remote: https://git.code.sf.net/p/opencore-amr/fdk-aac
+            name: fdk-aac
           - remote: https://code.videolan.org/videolan/x264
-            mirror: scufflecloud/x264-mirror
-            topics: [x264]
+            name: x264
           - remote: https://bitbucket.org/multicoreware/x265_git
-            mirror: scufflecloud/x265-mirror
-            topics: [x265]
+            name: x265
           - remote: https://aomedia.googlesource.com/aom
-            mirror: scufflecloud/aom-mirror
-            topics: [aom]
+            name: aom
           - remote: https://gitlab.com/AOMediaCodec/SVT-AV1
-            mirror: scufflecloud/SVT-AV1-mirror
-            topics: [SVT-AV1]
+            name: SVT-AV1
+    env:
+      TARGET_REPO: ${{ matrix.name }}-mirror
     steps:
       - name: Generate GitHub App token
         id: generate_token
-        uses: tibdex/github-app-token@v2.1
+        uses: actions/create-github-app-token@v1
         with:
-          app_id: ${{ secrets.GH_APP_ID }}
-          private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          repositories: ${{ matrix.mirror }}
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          repositories: ${{ env.TARGET_REPO }}
+
+      - name: Clone the remote repo as bare
+        run: |
+          git clone --bare "${{ matrix.remote }}" remote
+
+      - name: Fetch all updates (including LFS if available)
+        run: |
+          cd remote
+          git fetch --all
+
+      - name: Push to the mirror repo
+        run: |
+          cd remote
+          git push --mirror https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/${{ github.repository_owner }}/${{ env.TARGET_REPO }}
+      
+      - name: Get Default Branch
+        id: get_default_branch
+        run: |
+          cd remote
+          echo "default_branch=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_OUTPUT
 
       - name: Configure Repository
         uses: actions/github-script@v7
@@ -47,7 +64,9 @@ jobs:
           github-token: ${{ steps.generate_token.outputs.token }}
           script: |
             const ruleset = (target) => ({
-              name: 'no-update-${target}',
+              owner: '${{ github.repository_owner }}',
+              repo: '${{ env.TARGET_REPO }}',
+              name: `no-update-${target}`,
               target,
               enforcement: 'active',
               bypass_actors: [
@@ -84,35 +103,84 @@ jobs:
               }
             });
 
-            await github.request('POST /repos/${{ matrix.mirror }}/rulesets', ruleset('branch'));
-            await github.request('POST /repos/${{ matrix.mirror }}/rulesets', ruleset('tag'));
-            await github.request('PATCH /repos/${{ matrix.mirror }}', {
+            // get all rulesets
+            const rulesets = await github.request('GET /repos/{owner}/{repo}/rulesets', {
+              owner: '${{ github.repository_owner }}',
+              repo: '${{ env.TARGET_REPO }}',
+              headers: {
+                'X-GitHub-Api-Version': '2022-11-28'
+              }
+            });
+
+            // create branch ruleset if it doesn't exist
+            const branchRuleset = rulesets.data.find(ruleset => ruleset.name === `no-update-branch`);
+            if (branchRuleset) {
+              await github.request('PUT /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+                owner: '${{ github.repository_owner }}',
+                repo: '${{ env.TARGET_REPO }}',
+                ruleset_id: branchRuleset.id,
+                ...ruleset('branch'),
+              });
+            } else {
+              await github.request('POST /repos/{owner}/{repo}/rulesets', ruleset('branch'));
+            }
+
+            // create tag ruleset if it doesn't exist
+            const tagRuleset = rulesets.data.find(ruleset => ruleset.name === `no-update-tag`);
+            if (tagRuleset) {
+              await github.request('PUT /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+                owner: '${{ github.repository_owner }}',
+                repo: '${{ env.TARGET_REPO }}',
+                ruleset_id: tagRuleset.id,
+                ...ruleset('tag'),
+              });
+            } else {
+              await github.request('POST /repos/{owner}/{repo}/rulesets', ruleset('tag'));
+            }
+
+            // delete all other rulesets
+            for (const ruleset of rulesets.data) {
+              if (ruleset.name !== `no-update-branch` && ruleset.name !== `no-update-tag`) {
+                await github.request('DELETE /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+                  owner: '${{ github.repository_owner }}',
+                  repo: '${{ env.TARGET_REPO }}',
+                  ruleset_id: ruleset.id,
+                });
+              }
+            }
+
+            // disable github actions for this repo
+            await github.request('PUT /repos/{owner}/{repo}/actions/permissions', {
+              owner: '${{ github.repository_owner }}',
+              repo: '${{ env.TARGET_REPO }}',
+              enabled: false,
+              headers: {
+                'X-GitHub-Api-Version': '2022-11-28'
+              }
+            });
+
+            // disable issues, projects, and wiki for this repo
+            await github.request('PATCH /repos/{owner}/{repo}', {
+              owner: '${{ github.repository_owner }}',
+              repo: '${{ env.TARGET_REPO }}',
               description: 'Mirror of ${{ matrix.remote }}',
               homepage: '${{ matrix.remote }}',
               has_issues: false,
               has_projects: false,
               has_wiki: false,
+              visibility: 'public',
+              default_branch: '${{ steps.get_default_branch.outputs.default_branch }}',
               headers: {
                 'X-GitHub-Api-Version': '2022-11-28'
               }
             });
-            await github.request('PUT /repos/${{ matrix.mirror }}/topics', {
-              names: ${{ toJSON(matrix.topics) }}.concat(['mirror']),
+
+            // add mirror topic to the repo
+            await github.request('PUT /repos/{owner}/{repo}/topics', {
+              owner: '${{ github.repository_owner }}',
+              repo: '${{ env.TARGET_REPO }}',
+              names: ['mirror', '${{ matrix.name }}'],
               headers: {
                 'X-GitHub-Api-Version': '2022-11-28'
               }
             });
-
-      - name: Clone the remote repo as bare
-        run: |
-          git clone --bare "${{ matrix.remote }}" remote
-
-      - name: Fetch all updates (including LFS if available)
-        run: |
-          cd remote
-          git fetch --all
-
-      - name: Push to the mirror repo
-        run: |
-          cd remote
-          git push --mirror https://${{ steps.generate_token.outputs.token }}@github.com/${{ matrix.mirror }}
